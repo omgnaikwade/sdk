@@ -2,6 +2,7 @@ import { Song } from "./index";
 import { runOperation } from "./saavn/run-operation";
 import { SaavnWebRadio } from "./saavn/operations/index.js";
 import { fetchFromSaavn } from "./helpers/fetch.js";
+import { mapSong } from "./saavn/common-mapper.js";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -68,12 +69,59 @@ async function createStation(songId: string) {
 }
 
 
+
+function decodeHtml(v: unknown) {
+  if (typeof v !== "string") return v;
+  return v
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function cleanSong(song: any) {
+  if (!song) return song;
+  song.title = decodeHtml(song.title);
+  song.subtitle = decodeHtml(song.subtitle);
+  if (song.album) song.album.title = decodeHtml(song.album.title);
+  return song;
+}
+
+// Saavn reco sirf ctx=android pe data deta hai, aur response { [songId]: [songs] } hota hai
+async function getAndroidReco(songId: string, limit: number) {
+  const res = await fetchFromSaavn({
+    call: "reco.getreco",
+    params: { pid: songId, ctx: "android" },
+    context: "android",
+  });
+
+  const data: any = res.data;
+  let list: any[] = [];
+  if (Array.isArray(data)) list = data;
+  else if (data && typeof data === "object") {
+    list = Array.isArray(data[songId])
+      ? data[songId]
+      : (Object.values(data).find((v) => Array.isArray(v)) as any[]) ?? [];
+  }
+
+  const songs: any[] = [];
+  for (const raw of list) {
+    try {
+      songs.push(mapSong(raw));
+    } catch {
+      // schema mismatch -> skip this item
+    }
+  }
+  return songs.slice(0, limit);
+}
+
 // Reco/radio khali aaye to artist/album search se similar songs banao
 async function getSimilar(songId: string, limit: number) {
   try {
-    const r: any = await Song.getRecommendations({ songId });
-    if (Array.isArray(r) && r.length > 0) {
-      return { songs: r.slice(0, limit), via: "recommendations" };
+    const r = await getAndroidReco(songId, limit);
+    if (r.length > 0) {
+      return { songs: r.map(cleanSong), via: "recommendations" };
     }
   } catch {
     // ignore, fallback below
@@ -105,7 +153,7 @@ async function getSimilar(songId: string, limit: number) {
   }
 
   if (songs.length === 0) throw new Error("No similar songs found");
-  return { songs: songs.slice(0, limit), via: "search-fallback" };
+  return { songs: songs.slice(0, limit).map(cleanSong), via: "search-fallback" };
 }
 
 async function peek(call: string, params: Record<string, string>, context: "web6dot0" | "android") {
