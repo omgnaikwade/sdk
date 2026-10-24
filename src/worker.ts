@@ -19,6 +19,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Request failed";
 }
 
+function errorDetails(error: unknown) {
+  const err = error as {
+    message?: string;
+    code?: string;
+    details?: unknown;
+    cause?: unknown;
+  };
+
+  return {
+    error: err.message ?? "Unknown error",
+    code: err.code ?? null,
+    details: err.details ?? null,
+    cause: err.cause instanceof Error ? err.cause.message : null,
+  };
+}
+
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -37,6 +53,7 @@ export default {
       return json({ success: false, error: "Method not allowed" }, 405);
     }
 
+    // Health check
     if (url.pathname === "/") {
       return json({
         status: "ok",
@@ -44,17 +61,20 @@ export default {
         endpoints: [
           "/api/search?q=Tum%20Hi%20Ho",
           "/api/radio/start?id=SONG_ID",
-          "/api/radio/next?id=STATION_ID&next=true",
+          "/api/radio/next?id=STATION_ID&limit=20",
         ],
       });
     }
 
-    // Existing song search endpoint
+    // Song search
     if (url.pathname === "/api/search") {
       const query = url.searchParams.get("q")?.trim();
 
       if (!query) {
-        return json({ success: false, error: "Missing q parameter" }, 400);
+        return json(
+          { success: false, error: "Missing q parameter" },
+          400,
+        );
       }
 
       const limit = Math.min(
@@ -74,19 +94,30 @@ export default {
           offset,
         });
 
-        return json({ success: true, query, page: offset, results });
+        return json({
+          success: true,
+          query,
+          page: offset,
+          results,
+        });
       } catch (error) {
-        return json({ success: false, error: errorMessage(error) }, 502);
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
       }
     }
 
-    // Create a JioSaavn radio station from a song ID
+    // Create radio station using a song ID
     if (url.pathname === "/api/radio/start") {
       const songId = url.searchParams.get("id")?.trim();
 
       if (!songId) {
         return json(
-          { success: false, error: "Missing song ID. Use ?id=SONG_ID" },
+          {
+            success: false,
+            error: "Missing song ID. Use ?id=SONG_ID",
+          },
           400,
         );
       }
@@ -108,33 +139,23 @@ export default {
           station,
         });
       } catch (error) {
-  const err = error as {
-    message?: string;
-    code?: string;
-    details?: unknown;
-    cause?: unknown;
-  };
-
-  return json(
-    {
-      success: false,
-      error: err.message ?? "Unknown error",
-      code: err.code ?? null,
-      details: err.details ?? null,
-      cause: err.cause instanceof Error ? err.cause.message : null,
-    },
-    502,
-  );
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
       }
-    
+    }
 
-    // Fetch songs from an existing JioSaavn radio station
+    // Fetch radio songs
     if (url.pathname === "/api/radio/next") {
       const stationId = url.searchParams.get("id")?.trim();
 
       if (!stationId) {
         return json(
-          { success: false, error: "Missing station ID. Use ?id=STATION_ID" },
+          {
+            success: false,
+            error: "Missing station ID. Use ?id=STATION_ID",
+          },
           400,
         );
       }
@@ -148,12 +169,15 @@ export default {
       const next = nextParam === "true" || nextParam === "1";
 
       try {
-        const result = await runOperation(SaavnWebRadio.songs, {
-          ctx: "android",
-          stationid: stationId,
-          k: String(limit),
-          next: next ? "1" : "0",
-        });
+        const result = await runOperation(
+          SaavnWebRadio.songs,
+          {
+            ctx: "android",
+            stationid: stationId,
+            k: String(limit),
+            next: next ? "1" : "0",
+          },
+        );
 
         return json({
           success: true,
@@ -162,17 +186,18 @@ export default {
         });
       } catch (error) {
         return json(
-          {
-            success: false,
-            error: errorMessage(error),
-          },
+          { success: false, ...errorDetails(error) },
           502,
         );
       }
     }
 
     return json(
-      { success: false, error: "Endpoint not found", path: url.pathname },
+      {
+        success: false,
+        error: "Endpoint not found",
+        path: url.pathname,
+      },
       404,
     );
   },
