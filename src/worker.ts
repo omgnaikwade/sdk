@@ -8,21 +8,62 @@ function json(data: unknown, status = 200): Response {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
       "Cache-Control": "no-store",
     },
   });
 }
 
 function errorDetails(error: unknown) {
-  if (error instanceof Error) {
-    return {
-      message: error.message,
-      name: error.name,
-      cause: error.cause ?? null,
-    };
+  const err = error as {
+    message?: string;
+    code?: string;
+    details?: unknown;
+    cause?: unknown;
+  };
+
+  return {
+    error: err.message ?? "Unknown error",
+    code: err.code ?? null,
+    details: err.details ?? null,
+    cause: err.cause instanceof Error ? err.cause.message : null,
+  };
+}
+
+
+type RadioResult = { stationId: string; songs: unknown[] };
+
+// Saavn radio: next=1 pehle try karo (naye songs), fail ho to next=0
+async function fetchRadioSongs(stationId: string, limit: number) {
+  let lastError: unknown = null;
+
+  for (const next of ["1", "0"] as const) {
+    try {
+      const result = (await runOperation(SaavnWebRadio.songs, {
+        ctx: "android",
+        stationid: stationId,
+        k: String(limit),
+        next,
+      })) as RadioResult;
+
+      if (result.songs && result.songs.length > 0) {
+        return { result, next };
+      }
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  return { message: String(error) };
+  throw lastError ?? new Error("Radio returned no songs");
+}
+
+async function createStation(songId: string) {
+  return runOperation(SaavnWebRadio.createEntityStation, {
+    ctx: "android",
+    entity_type: "queue",
+    entity_id: JSON.stringify([songId]),
+  });
 }
 
 export default {
@@ -31,7 +72,6 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -40,181 +80,218 @@ export default {
       });
     }
 
-    try {
-      // Health check
-      if (url.pathname === "/" && request.method === "GET") {
-        return json({
-          success: true,
-          message: "JioSaavn SDK Worker is running",
-        });
+    if (request.method !== "GET") {
+      return json({ success: false, error: "Method not allowed" }, 405);
+    }
+
+    // Health check
+    if (url.pathname === "/") {
+      return json({
+        status: "ok",
+        message: "Saavn SDK API is running",
+        endpoints: [
+          "/api/search?q=Tum%20Hi%20Ho",
+          "/api/recommendations?id=SONG_ID",
+          "/api/radio/start?id=SONG_ID&limit=20",
+          "/api/radio/next?id=STATION_ID&limit=20&seed=SONG_ID",
+        ],
+      });
+    }
+
+    // Song search
+    if (url.pathname === "/api/search") {
+      const query = url.searchParams.get("q")?.trim();
+
+      if (!query) {
+        return json(
+          { success: false, error: "Missing q parameter" },
+          400,
+        );
       }
 
-      // Search songs
-      if (url.pathname === "/api/search" && request.method === "GET") {
-        const query = url.searchParams.get("q")?.trim();
+      const limit = Math.min(
+        50,
+        Math.max(1, Number(url.searchParams.get("limit")) || 20),
+      );
 
-        if (!query) {
-          return json(
-            { success: false, error: "Missing search query. Use ?q=SONG_NAME" },
-            400
-          );
-        }
+      const offset = Math.max(
+        1,
+        Number(url.searchParams.get("page")) || 1,
+      );
 
-        const result = await Song.search({
+      try {
+        const results = await Song.search({
           query,
-          limit: Number(url.searchParams.get("limit") || 20),
-          offset: Number(url.searchParams.get("page") || 1),
+          limit,
+          offset,
         });
 
         return json({
           success: true,
           query,
-          page: Number(url.searchParams.get("page") || 1),
-          results: result,
+          page: offset,
+          results,
         });
+      } catch (error) {
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
       }
+    }
 
-      // Create radio station using one or two seed song IDs
-      if (url.pathname === "/api/radio/start" && request.method === "GET") {
-        const idsParam = url.searchParams.get("ids");
-        const singleId = url.searchParams.get("id");
+    // Song recommendations
+    if (url.pathname === "/api/recommendations") {
+      const songId = url.searchParams.get("id")?.trim();
 
-        const songIds = (
-          idsParam
-            ? idsParam.split(",")
-            : singleId
-              ? [singleId]
-              : []
-        )
-          .map((id) => id.trim())
-          .filter(Boolean);
-
-        if (songIds.length === 0) {
-          return json(
-            {
-              success: false,
-              error: "Provide a song ID using ?id=SONG_ID or ?ids=ID1,ID2",
-            },
-            400
-          );
-        }
-
-        if (songIds.length > 2) {
-          return json(
-            {
-              success: false,
-              error: "For this test, provide a maximum of two song IDs.",
-            },
-            400
-          );
-        }
-
-        const station = await runOperation(
-          SaavnWebRadio.createEntityStation,
+      if (!songId) {
+        return json(
           {
-            ctx: "android",
-            entity_type: "queue",
-            entity_id: JSON.stringify(songIds),
-          }
+            success: false,
+            error: "Missing song ID. Use ?id=SONG_ID",
+          },
+          400,
         );
-
-        return json({
-          success: true,
-          source: "JioSaavn Web Radio",
-          seedSongIds: songIds,
-          station,
-        });
       }
 
-      // Get radio songs
-      if (url.pathname === "/api/radio/next" && request.method === "GET") {
-        const stationId = url.searchParams.get("id")?.trim();
-
-        if (!stationId) {
-          return json(
-            {
-              success: false,
-              error: "Missing station ID. Use ?id=STATION_ID",
-            },
-            400
-          );
-        }
-
-        const limit = Math.min(
-          50,
-          Math.max(1, Number(url.searchParams.get("limit") || 20))
-        );
-
-        const next = url.searchParams.get("next") !== "false";
-
-        const result = await runOperation(SaavnWebRadio.songs, {
-          ctx: "android",
-          stationid: stationId,
-          k: String(limit),
-          next: next ? "1" : "0",
+      try {
+        const results = await Song.getRecommendations({
+          songId,
         });
 
         return json({
           success: true,
+          source: "JioSaavn Recommendations",
+          seedSongId: songId,
+          results,
+        });
+      } catch (error) {
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
+      }
+    }
+
+    // Create radio station (+ first songs in one go)
+    if (url.pathname === "/api/radio/start") {
+      const songId = url.searchParams.get("id")?.trim();
+
+      if (!songId) {
+        return json(
+          { success: false, error: "Missing song ID. Use ?id=SONG_ID" },
+          400,
+        );
+      }
+
+      const limit = Math.min(
+        50,
+        Math.max(1, Number(url.searchParams.get("limit")) || 20),
+      );
+
+      try {
+        const station = await createStation(songId);
+
+        try {
+          const { result } = await fetchRadioSongs(station.stationId, limit);
+          return json({
+            success: true,
+            source: "JioSaavn Web Radio",
+            seedSongId: songId,
+            station,
+            songs: result.songs,
+          });
+        } catch {
+          // Radio ne songs nahi diye -> recommendations fallback
+          const songs = await Song.getRecommendations({ songId });
+          return json({
+            success: true,
+            source: "JioSaavn Recommendations (radio fallback)",
+            seedSongId: songId,
+            station,
+            songs,
+            fallback: true,
+          });
+        }
+      } catch (error) {
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
+      }
+    }
+
+    // Fetch radio songs
+    // /api/radio/next?id=STATION_ID&limit=20&seed=SONG_ID(optional)
+    if (url.pathname === "/api/radio/next") {
+      const stationId = url.searchParams.get("id")?.trim();
+      const seedId = url.searchParams.get("seed")?.trim();
+
+      if (!stationId) {
+        return json(
+          { success: false, error: "Missing station ID. Use ?id=STATION_ID" },
+          400,
+        );
+      }
+
+      const limit = Math.min(
+        50,
+        Math.max(1, Number(url.searchParams.get("limit")) || 20),
+      );
+
+      try {
+        const { result, next } = await fetchRadioSongs(stationId, limit);
+        return json({
+          success: true,
           source: "JioSaavn Web Radio",
-          stationId,
+          usedNext: next,
           result,
         });
-      }
-
-      // Song recommendations
-      if (
-        url.pathname === "/api/recommendations" &&
-        request.method === "GET"
-      ) {
-        const songId = url.searchParams.get("id")?.trim();
-
-        if (!songId) {
-          return json(
-            {
-              success: false,
-              error: "Missing song ID. Use ?id=SONG_ID",
-            },
-            400
-          );
+      } catch (error) {
+        // Station expire/empty ho gaya -> seed se naya station banao
+        if (seedId) {
+          try {
+            const station = await createStation(seedId);
+            const { result } = await fetchRadioSongs(station.stationId, limit);
+            return json({
+              success: true,
+              source: "JioSaavn Web Radio (new station)",
+              newStationId: station.stationId,
+              result,
+            });
+          } catch {
+            try {
+              const songs = await Song.getRecommendations({ songId: seedId });
+              return json({
+                success: true,
+                source: "JioSaavn Recommendations (radio fallback)",
+                result: { stationId, songs },
+                fallback: true,
+              });
+            } catch (fallbackError) {
+              return json(
+                { success: false, ...errorDetails(fallbackError) },
+                502,
+              );
+            }
+          }
         }
 
-        const result = await Song.getRecommendations({ songId });
-
-        return json({
-          success: true,
-          songId,
-          results: result,
-        });
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
       }
-
-      return json(
-        {
-          success: false,
-          error: "Route not found",
-          availableRoutes: [
-            "/",
-            "/api/search?q=Tum%20Hi%20Ho",
-            "/api/radio/start?id=SONG_ID",
-            "/api/radio/start?ids=ID1,ID2",
-            "/api/radio/next?id=STATION_ID&limit=20&next=true",
-            "/api/recommendations?id=SONG_ID",
-          ],
-        },
-        404
-      );
-    } catch (error) {
-      return json(
-        {
-          success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : "An unexpected error occurred",
-          details: errorDetails(error),
-        },
-        500
-      );
     }
+
+    // Unknown endpoint
+    return json(
+      {
+        success: false,
+        error: "Endpoint not found",
+        path: url.pathname,
+      },
+      404,
+    );
   },
 };
