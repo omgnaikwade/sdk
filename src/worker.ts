@@ -108,15 +108,25 @@ export default {
           station,
         });
       } catch (error) {
-        return json(
-          {
-            success: false,
-            error: errorMessage(error),
-          },
-          502,
-        );
+  const err = error as {
+    message?: string;
+    code?: string;
+    details?: unknown;
+    cause?: unknown;
+  };
+
+  return json(
+    {
+      success: false,
+      error: err.message ?? "Unknown error",
+      code: err.code ?? null,
+      details: err.details ?? null,
+      cause: err.cause instanceof Error ? err.cause.message : null,
+    },
+    502,
+  );
       }
-    }
+    
 
     // Fetch songs from an existing JioSaavn radio station
     if (url.pathname === "/api/radio/next") {
