@@ -67,7 +67,7 @@ export const fetchFromSaavn = async ({
   url.searchParams.append('ctx', context);
 
   for (const [k, v] of Object.entries(params)) {
-    url.searchParams.append(k, String(v));
+    url.searchParams.set(k, String(v));
   }
 
   const controller = timeoutMs ? new AbortController() : undefined;
