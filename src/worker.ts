@@ -1,6 +1,7 @@
 import { Song } from "./index";
 import { runOperation } from "./saavn/run-operation";
 import { SaavnWebRadio } from "./saavn/operations/index.js";
+import { fetchFromSaavn } from "./helpers/fetch.js";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -66,6 +67,56 @@ async function createStation(songId: string) {
   });
 }
 
+
+// Reco/radio khali aaye to artist/album search se similar songs banao
+async function getSimilar(songId: string, limit: number) {
+  try {
+    const r: any = await Song.getRecommendations({ songId });
+    if (Array.isArray(r) && r.length > 0) {
+      return { songs: r.slice(0, limit), via: "recommendations" };
+    }
+  } catch {
+    // ignore, fallback below
+  }
+
+  const details: any = await Song.getById({ songIds: songId });
+  const seed = details?.songs?.[0];
+  if (!seed) throw new Error("Seed song not found for id: " + songId);
+
+  const artist = seed.artists?.primary?.[0]?.name;
+  const queries = [artist, seed.album?.title, seed.title].filter(Boolean);
+
+  const seen = new Set<string>([songId]);
+  const songs: any[] = [];
+
+  for (const q of queries) {
+    try {
+      const res: any = await Song.search({ query: q as string, limit: 30 });
+      for (const item of res?.results ?? []) {
+        if (item?.id && !seen.has(item.id)) {
+          seen.add(item.id);
+          songs.push(item);
+        }
+      }
+    } catch {
+      // next query
+    }
+    if (songs.length >= limit) break;
+  }
+
+  if (songs.length === 0) throw new Error("No similar songs found");
+  return { songs: songs.slice(0, limit), via: "search-fallback" };
+}
+
+async function peek(call: string, params: Record<string, string>, context: "web6dot0" | "android") {
+  try {
+    const res = await fetchFromSaavn({ call, params, context });
+    return { status: res.status, body: JSON.stringify(res.data).slice(0, 300) };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -94,6 +145,7 @@ export default {
           "/api/recommendations?id=SONG_ID",
           "/api/radio/start?id=SONG_ID&limit=20",
           "/api/radio/next?id=STATION_ID&limit=20&seed=SONG_ID",
+          "/api/debug?id=SONG_ID",
         ],
       });
     }
@@ -155,15 +207,16 @@ export default {
       }
 
       try {
-        const results = await Song.getRecommendations({
+        const { songs, via } = await getSimilar(
           songId,
-        });
+          Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 20)),
+        );
 
         return json({
           success: true,
-          source: "JioSaavn Recommendations",
+          source: via,
           seedSongId: songId,
-          results,
+          results: songs,
         });
       } catch (error) {
         return json(
@@ -203,10 +256,10 @@ export default {
           });
         } catch {
           // Radio ne songs nahi diye -> recommendations fallback
-          const songs = await Song.getRecommendations({ songId });
+          const { songs, via } = await getSimilar(songId, limit);
           return json({
             success: true,
-            source: "JioSaavn Recommendations (radio fallback)",
+            source: via + " (radio fallback)",
             seedSongId: songId,
             station,
             songs,
@@ -261,10 +314,10 @@ export default {
             });
           } catch {
             try {
-              const songs = await Song.getRecommendations({ songId: seedId });
+              const { songs, via } = await getSimilar(seedId, limit);
               return json({
                 success: true,
-                source: "JioSaavn Recommendations (radio fallback)",
+                source: via + " (radio fallback)",
                 result: { stationId, songs },
                 fallback: true,
               });
@@ -282,6 +335,53 @@ export default {
           502,
         );
       }
+    }
+
+    // Debug: Saavn kya return kar raha hai
+    if (url.pathname === "/api/debug") {
+      const id = url.searchParams.get("id")?.trim() || "aRZbUYD7";
+      const out: Record<string, unknown> = {
+        cf: {
+          country: (request as any).cf?.country,
+          colo: (request as any).cf?.colo,
+        },
+      };
+
+      try {
+        const t = await (await fetch("https://www.cloudflare.com/cdn-cgi/trace")).text();
+        out.egress = t.split("\n").filter((l) => /^(ip|loc|colo)=/.test(l));
+      } catch {
+        out.egress = "trace failed";
+      }
+
+      out.reco_web = await peek("reco.getreco", { pid: id }, "web6dot0");
+      out.reco_android = await peek("reco.getreco", { pid: id, ctx: "android" }, "android");
+
+      let stationId = "";
+      try {
+        const st: any = await createStation(id);
+        stationId = st.stationId;
+        out.station = stationId;
+      } catch (e) {
+        out.station = "create failed: " + (e as Error).message;
+      }
+
+      if (stationId) {
+        for (const next of ["0", "1"]) {
+          out["radio_android_next" + next] = await peek(
+            "webradio.getSong",
+            { stationid: stationId, k: "10", next, ctx: "android" },
+            "android",
+          );
+          out["radio_web_next" + next] = await peek(
+            "webradio.getSong",
+            { stationid: stationId, k: "10", next },
+            "web6dot0",
+          );
+        }
+      }
+
+      return json(out);
     }
 
     // Unknown endpoint
