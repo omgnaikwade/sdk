@@ -277,6 +277,7 @@ async function buildQueueIds(opts: {
   debug: boolean;
 }) {
   const { seeds, exclude, skipped, liked, target } = opts;
+  const firstSeed = seeds[0] as string;
 
   // 1) recos + seed/skipped/liked metadata, parallel
   const metaIds = [
@@ -290,7 +291,6 @@ async function buildQueueIds(opts: {
   const meta = new Map<string, any>();
   for (const sg of (metaRes as any)?.songs ?? []) meta.set(sg.id, sg);
 
-  const firstSeed = seeds[0] as string;
   const seed0 = meta.get(firstSeed);
   const lang0 = String(seed0?.language ?? "").toLowerCase();
   const year0 = Number(seed0?.year) || 0;
@@ -303,8 +303,7 @@ async function buildQueueIds(opts: {
 
   // 2) candidates + consensus score
   const cand = new Map<string, { song: any; score: number; hits: number }>();
-  recoLists.forEach((list, i) => {
-    const w = SEED_WEIGHTS[i] ?? 0.25;
+  const addList = (list: any[], w: number) => {
     list.forEach((song, rank) => {
       if (!song?.id || exclude.has(song.id)) return;
       const c = cand.get(song.id) ?? { song, score: 0, hits: 0 };
@@ -312,7 +311,36 @@ async function buildQueueIds(opts: {
       c.hits += 1;
       cand.set(song.id, c);
     });
-  });
+  };
+  recoLists.forEach((list, i) => addList(list, SEED_WEIGHTS[i] ?? 0.25));
+
+  // 2b) 2-hop expansion: pool chhota ho to top recos ke apne recos lo (alag artists aate hain)
+  let expanded = false;
+  if (cand.size < 45) {
+    const hop = [...cand.values()]
+      .sort((x, y) => y.score - x.score)
+      .slice(0, 5)
+      .map((c) => c.song.id as string);
+    const hopLists = await Promise.all(hop.map((id) => cachedReco(id)));
+    hopLists.forEach((list) => addList(list, 0.3));
+    expanded = hop.length > 0;
+  }
+
+  // 2c) abhi bhi kam ho to seed language ke trending songs (artist-search nahi)
+  let usedTrending = false;
+  if (cand.size < target + 6) {
+    try {
+      const trend: any = await Song.getTrending({ language: lang0 || "hindi" });
+      const list: any[] = Array.isArray(trend) ? trend : trend?.songs ?? [];
+      list.forEach((song) => {
+        if (!song?.id || exclude.has(song.id) || cand.has(song.id)) return;
+        cand.set(song.id, { song, score: 0.05, hits: 0 });
+      });
+      usedTrending = true;
+    } catch {
+      // ignore
+    }
+  }
 
   // 3) taste adjustments + filters
   const scored: { id: string; song: any; score: number; hits: number }[] = [];
@@ -331,8 +359,8 @@ async function buildQueueIds(opts: {
     if (lang0 && lang) score += lang === lang0 ? 0.35 : -0.25;
 
     const ak = artistKey(song);
-    if (ak && seedArtists.has(ak)) score += 0.2;
-    if (ak && likedArtists.has(ak)) score += 0.3;
+    if (ak && seedArtists.has(ak)) score += 0.05; // artist ka bonus chhota, taaki queue artist-only na ho
+    if (ak && likedArtists.has(ak)) score += 0.15;
     if (ak && skippedArtists.has(ak)) score -= 1.2;
 
     const pc = Number(song.stats?.playCount) || 0;
@@ -345,7 +373,7 @@ async function buildQueueIds(opts: {
   }
 
   // 4) duplicate versions hatao (same title + same artist => best score rakho)
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((x, y) => y.score - x.score);
   const seenKey = new Set<string>();
   const unique = scored.filter((c) => {
     const key = baseTitle(c.song.title) + "|" + artistKey(c.song);
@@ -354,33 +382,42 @@ async function buildQueueIds(opts: {
     return true;
   });
 
-  // 5) fallback: reco khali/kam ho to search-based similar
-  if (unique.length < target) {
+  // 5) last resort: kuch bhi na mile to search-based similar (relaxed artist cap)
+  let relaxed = false;
+  if (unique.length === 0) {
     try {
       const sim = await getSimilar(firstSeed, 30);
       for (const song of sim.songs) {
-        if (!song?.id || exclude.has(song.id) || cand.has(song.id)) continue;
-        const key = baseTitle(song.title) + "|" + artistKey(song);
-        if (seenKey.has(key) || seedTitles.has(baseTitle(song.title))) continue;
-        seenKey.add(key);
+        if (!song?.id || exclude.has(song.id)) continue;
         unique.push({ id: song.id, song, score: 0.1, hits: 0 });
       }
+      relaxed = true;
     } catch {
       // ignore
     }
   }
 
-  if (unique.length === 0) return { ids: [] as string[], debug: [] as any[] };
+  if (unique.length === 0) return { ids: [] as string[], debug: [] as any[], stats: {} };
 
-  // 6) diversity re-rank (greedy)
-  const pool = unique.slice(0, 40);
+  // 6) diversity re-rank (greedy) — artist cap 2 (fill me bhi lagta hai)
+  const artistCap = relaxed ? 4 : 2;
+  const pool = unique.slice(0, 50);
   const chosen: typeof pool = [];
   const artistCount = new Map<string, number>();
   const albumCount = new Map<string, number>();
   let lastArtist = "";
   const exploreSlots = target >= 10 ? 2 : 0;
   const mainTarget = target - exploreSlots;
-  const mainPool = pool.slice(0, 26);
+  const mainPool = pool.slice(0, 30);
+
+  const take = (pick: (typeof pool)[number]) => {
+    const ak = artistKey(pick.song);
+    const al = String(pick.song.album?.id ?? pick.song.album?.title ?? "");
+    artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
+    if (al) albumCount.set(al, (albumCount.get(al) ?? 0) + 1);
+    lastArtist = ak;
+    chosen.push(pick);
+  };
 
   while (chosen.length < mainTarget && mainPool.length > 0) {
     let bestIdx = -1;
@@ -390,7 +427,7 @@ async function buildQueueIds(opts: {
       if (!c) continue;
       const ak = artistKey(c.song);
       const al = String(c.song.album?.id ?? c.song.album?.title ?? "");
-      if ((artistCount.get(ak) ?? 0) >= 2) continue;
+      if ((artistCount.get(ak) ?? 0) >= artistCap) continue;
       if (al && (albumCount.get(al) ?? 0) >= 2) continue;
       const v =
         c.score -
@@ -406,28 +443,44 @@ async function buildQueueIds(opts: {
     if (bestIdx === -1) break;
     const pick = mainPool.splice(bestIdx, 1)[0];
     if (!pick) break;
-    const ak = artistKey(pick.song);
-    const al = String(pick.song.album?.id ?? pick.song.album?.title ?? "");
-    artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
-    if (al) albumCount.set(al, (albumCount.get(al) ?? 0) + 1);
-    lastArtist = ak;
-    chosen.push(pick);
+    take(pick);
   }
 
-  // 7) exploration: neeche ranked songs me se random 2, queue me 5th aur 9th jagah
+  // 7) exploration: neeche ranked songs me se random 2 (artist cap ke andar)
   const chosenIds = new Set(chosen.map((c) => c.id));
   const explorePool = shuffleArr(
-    pool.slice(12).filter((c) => !chosenIds.has(c.id)),
+    pool.slice(12).filter(
+      (c) =>
+        !chosenIds.has(c.id) &&
+        (artistCount.get(artistKey(c.song)) ?? 0) < artistCap,
+    ),
   ).slice(0, exploreSlots);
   explorePool.forEach((c, i) => {
     chosen.splice(Math.min(4 + i * 4, chosen.length), 0, c);
+    const ak = artistKey(c.song);
+    artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
   });
 
-  // agar abhi bhi kam hai, bacha hua pool bhar do
-  for (const c of unique) {
-    if (chosen.length >= target) break;
-    if (!chosen.some((x) => x.id === c.id)) chosen.push(c);
+  // 8) fill: bacha pool, lekin artist cap todke nahi (pehle cap, phir cap+1)
+  for (const cap of [artistCap, artistCap + 1]) {
+    for (const c of unique) {
+      if (chosen.length >= target) break;
+      if (chosen.some((x) => x.id === c.id)) continue;
+      const ak = artistKey(c.song);
+      if ((artistCount.get(ak) ?? 0) >= cap) continue;
+      chosen.push(c);
+      artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
+    }
   }
+
+  const stats = {
+    candidates: cand.size,
+    afterFilter: unique.length,
+    expanded,
+    usedTrending,
+    relaxed,
+    uniqueArtists: new Set(chosen.map((c) => artistKey(c.song))).size,
+  };
 
   return {
     ids: chosen.map((c) => c.id),
@@ -440,6 +493,7 @@ async function buildQueueIds(opts: {
           hits: c.hits,
         }))
       : [],
+    stats,
   };
 }
 
@@ -771,7 +825,7 @@ export default {
       const debug = url.searchParams.get("debug") === "1";
 
       try {
-        const { ids, debug: dbg } = await buildQueueIds({
+        const { ids, debug: dbg, stats } = await buildQueueIds({
           seeds,
           exclude,
           skipped,
@@ -798,7 +852,7 @@ export default {
           engine: "vybe-queue-v1",
           count: data.length,
           data,
-          ...(debug ? { debug: dbg } : {}),
+          ...(debug ? { stats, debug: dbg } : {}),
         });
       } catch (error) {
         return json(
