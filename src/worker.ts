@@ -1,95 +1,82 @@
-import { Song, Album, Artist, Playlist, Extras } from './index.js';
-import { SDKError } from './helpers/errors.js';
-
-type Params = Record<string, unknown>;
-type Handler = (params: any) => Promise<unknown>;
-
-const METHODS: Record<string, Handler> = {
-  'Song.search': ({ query, limit, offset }) => Song.search({ query, limit, offset }),
-  'Song.getById': ({ songIds }) => Song.getById({ songIds }),
-  'Song.getByPermalink': ({ permalink }) => Song.getByPermalink({ permalink }),
-  'Song.getRecommendations': ({ songId }) => Song.getRecommendations({ songId }),
-  'Song.getTrending': ({ language }) => Song.getTrending({ language }),
-  'Album.search': ({ query, limit, offset }) => Album.search({ query, limit, offset }),
-  'Album.getById': ({ albumId }) => Album.getById({ albumId }),
-  'Album.getTrending': ({ language }) => Album.getTrending({ language }),
-  'Artist.search': ({ query, limit, offset }) => Artist.search({ query, limit, offset }),
-  'Artist.getById': ({ artistId }) => Artist.getById({ artistId }),
-  'Playlist.search': ({ query, limit, offset }) => Playlist.search({ query, limit, offset }),
-  'Playlist.getById': ({ playlistId }) => Playlist.getById({ playlistId }),
-  'Playlist.getTrending': ({ language }) => Playlist.getTrending({ language }),
-  'Extras.searchAll': ({ query }) => Extras.searchAll({ query }),
-  'Extras.getTrendingAll': () => Extras.getTrendingAll(),
-};
+import { Song } from "./index";
 
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data, null, 2), {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
     },
   });
 }
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    if (request.method === 'OPTIONS') return new Response(null, {
-      status: 204,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      },
-    });
-
     const url = new URL(request.url);
-    if (url.pathname === '/') {
-      return json({
-        status: 'ok',
-        message: 'Saavn SDK API is running',
-        endpoint: '/api/test?method=Song.search&query=arijit',
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
       });
     }
 
-    if (url.pathname !== '/api/test') {
-      return json({ success: false, error: 'Not found', path: url.pathname }, 404);
-    }
-
-    const method = url.searchParams.get('method');
-    if (!method || !Object.prototype.hasOwnProperty.call(METHODS, method)) {
+    if (url.pathname === "/") {
       return json({
-        success: false,
-        error: 'Unknown or missing method',
-        availableMethods: Object.keys(METHODS),
-      }, 400);
+        status: "ok",
+        message: "Saavn SDK API is running",
+        endpoints: ["/api/search?q=arijit%20singh"],
+      });
     }
 
-    const params: Params = {};
-    for (const [key, value] of url.searchParams.entries()) {
-      if (key === 'method') continue;
-      if (key === 'limit' || key === 'offset') {
-        const parsed = Number.parseInt(value, 10);
-        if (!Number.isFinite(parsed)) return json({ success: false, error: `${key} must be a number` }, 400);
-        params[key] = parsed;
-      } else {
-        params[key] = value;
+    if (url.pathname === "/api/search") {
+      const query = url.searchParams.get("q")?.trim();
+
+      if (!query) {
+        return json(
+          { error: 'Missing search query. Example: /api/search?q=Arijit%20Singh' },
+          400,
+        );
+      }
+
+      const limit = Math.min(
+        50,
+        Math.max(1, Number(url.searchParams.get("limit")) || 20),
+      );
+
+      const offset = Math.max(
+        1,
+        Number(url.searchParams.get("page")) || 1,
+      );
+
+      try {
+        const results = await Song.search({
+          query,
+          limit,
+          offset,
+        });
+
+        return json({
+          success: true,
+          query,
+          page: offset,
+          results,
+        });
+      } catch (error) {
+        return json(
+          {
+            success: false,
+            error: error instanceof Error ? error.message : "Song search failed",
+          },
+          502,
+        );
       }
     }
 
-    try {
-      const data = await METHODS[method](params);
-      return json({ success: true, method, params, data });
-    } catch (error) {
-      if (error instanceof SDKError) {
-        return json({ success: false, error: { name: error.name, code: error.code, message: error.message } }, 500);
-      }
-      return json({
-        success: false,
-        error: { name: 'Error', message: error instanceof Error ? error.message : String(error) },
-      }, 500);
-    }
+    return json({ error: "Endpoint not found", path: url.pathname }, 404);
   },
 };
