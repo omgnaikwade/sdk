@@ -124,7 +124,9 @@ const shuffleArr = <T,>(a: T[]): T[] => {
   const arr = [...a];
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+    const tmp = arr[i] as T;
+    arr[i] = arr[j] as T;
+    arr[j] = tmp;
   }
   return arr;
 };
@@ -288,7 +290,8 @@ async function buildQueueIds(opts: {
   const meta = new Map<string, any>();
   for (const sg of (metaRes as any)?.songs ?? []) meta.set(sg.id, sg);
 
-  const seed0 = meta.get(seeds[0]);
+  const firstSeed = seeds[0] as string;
+  const seed0 = meta.get(firstSeed);
   const lang0 = String(seed0?.language ?? "").toLowerCase();
   const year0 = Number(seed0?.year) || 0;
   const seedArtists = new Set(seeds.map((id) => artistKey(meta.get(id))).filter(Boolean));
@@ -354,7 +357,7 @@ async function buildQueueIds(opts: {
   // 5) fallback: reco khali/kam ho to search-based similar
   if (unique.length < target) {
     try {
-      const sim = await getSimilar(seeds[0], 30);
+      const sim = await getSimilar(firstSeed, 30);
       for (const song of sim.songs) {
         if (!song?.id || exclude.has(song.id) || cand.has(song.id)) continue;
         const key = baseTitle(song.title) + "|" + artistKey(song);
@@ -384,6 +387,7 @@ async function buildQueueIds(opts: {
     let bestVal = -Infinity;
     for (let i = 0; i < mainPool.length; i++) {
       const c = mainPool[i];
+      if (!c) continue;
       const ak = artistKey(c.song);
       const al = String(c.song.album?.id ?? c.song.album?.title ?? "");
       if ((artistCount.get(ak) ?? 0) >= 2) continue;
@@ -400,7 +404,8 @@ async function buildQueueIds(opts: {
       }
     }
     if (bestIdx === -1) break;
-    const [pick] = mainPool.splice(bestIdx, 1);
+    const pick = mainPool.splice(bestIdx, 1)[0];
+    if (!pick) break;
     const ak = artistKey(pick.song);
     const al = String(pick.song.album?.id ?? pick.song.album?.title ?? "");
     artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
@@ -815,7 +820,7 @@ export default {
 
       try {
         const t = await (await fetch("https://www.cloudflare.com/cdn-cgi/trace")).text();
-        out.egress = t.split("\n").filter((l) => /^(ip|loc|colo)=/.test(l));
+        out.egress = t.split("\n").filter((l: string) => /^(ip|loc|colo)=/.test(l));
       } catch {
         out.egress = "trace failed";
       }
