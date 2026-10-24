@@ -1,4 +1,4 @@
-import { Song, Album, Artist, Playlist, Extras } from "./src/index";
+import { Song, Album, Artist, Playlist, Extras } from "./index";
 
 export default {
   async fetch(request: Request): Promise<Response> {
