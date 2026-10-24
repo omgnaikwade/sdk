@@ -15,10 +15,6 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Request failed";
-}
-
 function errorDetails(error: unknown) {
   const err = error as {
     message?: string;
@@ -60,6 +56,7 @@ export default {
         message: "Saavn SDK API is running",
         endpoints: [
           "/api/search?q=Tum%20Hi%20Ho",
+          "/api/recommendations?id=SONG_ID",
           "/api/radio/start?id=SONG_ID",
           "/api/radio/next?id=STATION_ID&limit=20",
         ],
@@ -108,7 +105,40 @@ export default {
       }
     }
 
-    // Create radio station using a song ID
+    // Song recommendations
+    if (url.pathname === "/api/recommendations") {
+      const songId = url.searchParams.get("id")?.trim();
+
+      if (!songId) {
+        return json(
+          {
+            success: false,
+            error: "Missing song ID. Use ?id=SONG_ID",
+          },
+          400,
+        );
+      }
+
+      try {
+        const results = await Song.getRecommendations({
+          songId,
+        });
+
+        return json({
+          success: true,
+          source: "JioSaavn Recommendations",
+          seedSongId: songId,
+          results,
+        });
+      } catch (error) {
+        return json(
+          { success: false, ...errorDetails(error) },
+          502,
+        );
+      }
+    }
+
+    // Create radio station
     if (url.pathname === "/api/radio/start") {
       const songId = url.searchParams.get("id")?.trim();
 
@@ -192,6 +222,7 @@ export default {
       }
     }
 
+    // Unknown endpoint
     return json(
       {
         success: false,
