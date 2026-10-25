@@ -223,6 +223,7 @@ async function mergeWithStreams(metas: any[], quality: string) {
 const recoCache = new Map<string, { t: number; v: any[] }>();
 const RECO_TTL_MS = 30 * 60 * 1000;
 const SEED_WEIGHTS = [1, 0.55, 0.4, 0.3];
+const DISCOVER_SEED_WEIGHTS = [1, 0.7, 0.55, 0.4, 0.3, 0.25];
 
 async function cachedReco(songId: string): Promise<any[]> {
   const hit = recoCache.get(songId);
@@ -497,6 +498,256 @@ async function buildQueueIds(opts: {
   };
 }
 
+// ===== HOME DISCOVER ENGINE (queue se alag) =====
+async function buildDiscoverIds(opts: {
+  seeds: string[];
+  exclude: Set<string>;
+  skipped: string[];
+  liked: string[];
+  target: number;
+  debug: boolean;
+  langs: string[];
+}) {
+  const { seeds, exclude, skipped, liked, target, langs } = opts;
+  const firstSeed = seeds[0] ?? "";
+
+  // 1) recos + seed/skipped/liked metadata, parallel
+  const metaIds = [
+    ...new Set([...seeds, ...skipped.slice(0, 8), ...liked.slice(0, 5)]),
+  ];
+  const [recoLists, metaRes] = await Promise.all([
+    Promise.all(seeds.map((id) => cachedReco(id))),
+    (metaIds.length > 0
+      ? Song.getById({ songIds: metaIds }).catch(() => null)
+      : Promise.resolve(null)) as Promise<any>,
+  ]);
+
+  const meta = new Map<string, any>();
+  for (const sg of (metaRes as any)?.songs ?? []) meta.set(sg.id, sg);
+
+  const seed0 = meta.get(firstSeed);
+  const lang0 = String(seed0?.language ?? "").toLowerCase();
+  const year0 = Number(seed0?.year) || 0;
+  // user ki pasandida languages (taste) > seed ki language
+  const prefLangs = langs.length > 0 ? langs : lang0 ? [lang0] : [];
+  const seedArtists = new Set(seeds.map((id) => artistKey(meta.get(id))).filter(Boolean));
+  const skippedArtists = new Set(skipped.map((id) => artistKey(meta.get(id))).filter(Boolean));
+  const likedArtists = new Set(liked.map((id) => artistKey(meta.get(id))).filter(Boolean));
+  const seedTitles = new Set(
+    seeds.map((id) => baseTitle(meta.get(id)?.title)).filter(Boolean),
+  );
+
+  // 2) candidates + consensus score
+  const cand = new Map<string, { song: any; score: number; hits: number }>();
+  const addList = (list: any[], w: number) => {
+    list.forEach((song, rank) => {
+      if (!song?.id || exclude.has(song.id)) return;
+      const c = cand.get(song.id) ?? { song, score: 0, hits: 0 };
+      c.score += w * (1 - rank / (list.length + 5));
+      c.hits += 1;
+      cand.set(song.id, c);
+    });
+  };
+  recoLists.forEach((list, i) => addList(list, DISCOVER_SEED_WEIGHTS[i] ?? 0.25));
+
+  // 2b) 2-hop expansion: pool chhota ho to top recos ke apne recos lo (alag artists aate hain)
+  let expanded = false;
+  if (cand.size < 45) {
+    const hop = [...cand.values()]
+      .sort((x, y) => y.score - x.score)
+      .slice(0, 5)
+      .map((c) => c.song.id as string);
+    const hopLists = await Promise.all(hop.map((id) => cachedReco(id)));
+    hopLists.forEach((list) => addList(list, 0.3));
+    expanded = hop.length > 0;
+  }
+
+  // 2c) trending: taste languages ke liye hamesha (discover), warna pool kam ho to
+  let usedTrending = false;
+  const trendLangs = langs.length > 0 ? langs.slice(0, 2) : [lang0 || "hindi"];
+  if (langs.length > 0 || cand.size < target + 6) {
+    const lists = await Promise.all(
+      trendLangs.map(async (l) => {
+        try {
+          const t: any = await Song.getTrending({ language: l });
+          return (Array.isArray(t) ? t : t?.songs ?? []) as any[];
+        } catch {
+          return [] as any[];
+        }
+      }),
+    );
+    lists.forEach((list, i) => {
+      if (langs.length > 0) {
+        addList(list, i === 0 ? 0.55 : 0.3);
+      } else {
+        list.forEach((song) => {
+          if (!song?.id || exclude.has(song.id) || cand.has(song.id)) return;
+          cand.set(song.id, { song, score: 0.05, hits: 0 });
+        });
+      }
+    });
+    usedTrending = lists.some((l) => l.length > 0);
+  }
+
+  // 3) taste adjustments + filters
+  const scored: { id: string; song: any; score: number; hits: number }[] = [];
+  for (const [id, c] of cand) {
+    const song = c.song;
+    const dur = Number(song.duration) || 0;
+    if (dur && (dur < 60 || dur > 720)) continue;
+
+    const bt = baseTitle(song.title);
+    if (bt && seedTitles.has(bt)) continue; // same song ka remix/version
+
+    let score = c.score;
+    if (c.hits > 1) score += 0.35 * (c.hits - 1);
+
+    const lang = String(song.language ?? "").toLowerCase();
+    if (prefLangs.length > 0 && lang) {
+      const li = prefLangs.indexOf(lang);
+      score += li === 0 ? 0.4 : li > 0 ? 0.2 : -0.3;
+    }
+
+    const ak = artistKey(song);
+    if (ak && seedArtists.has(ak)) score += 0.05; // artist ka bonus chhota, taaki queue artist-only na ho
+    if (ak && likedArtists.has(ak)) score += 0.15;
+    if (ak && skippedArtists.has(ak)) score -= 1.2;
+
+    const pc = Number(song.stats?.playCount) || 0;
+    score += Math.min(0.3, Math.log10(pc + 1) / 20);
+
+    const yr = Number(song.year) || 0;
+    if (year0 && yr && Math.abs(yr - year0) <= 3) score += 0.1;
+
+    scored.push({ id, song, score, hits: c.hits });
+  }
+
+  // 4) duplicate versions hatao (same title + same artist => best score rakho)
+  scored.sort((x, y) => y.score - x.score);
+  const seenKey = new Set<string>();
+  const unique = scored.filter((c) => {
+    const key = baseTitle(c.song.title) + "|" + artistKey(c.song);
+    if (seenKey.has(key)) return false;
+    seenKey.add(key);
+    return true;
+  });
+
+  // 5) last resort: kuch bhi na mile to search-based similar (relaxed artist cap)
+  let relaxed = false;
+  if (unique.length === 0 && firstSeed) {
+    try {
+      const sim = await getSimilar(firstSeed, 30);
+      for (const song of sim.songs) {
+        if (!song?.id || exclude.has(song.id)) continue;
+        unique.push({ id: song.id, song, score: 0.1, hits: 0 });
+      }
+      relaxed = true;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (unique.length === 0) return { ids: [] as string[], debug: [] as any[], stats: {} };
+
+  // 6) diversity re-rank (greedy) — artist cap 2 (fill me bhi lagta hai)
+  const artistCap = relaxed ? 4 : 2;
+  const pool = unique.slice(0, 50);
+  const chosen: typeof pool = [];
+  const artistCount = new Map<string, number>();
+  const albumCount = new Map<string, number>();
+  let lastArtist = "";
+  const exploreSlots = target >= 10 ? 2 : 0;
+  const mainTarget = target - exploreSlots;
+  const mainPool = pool.slice(0, 30);
+
+  const take = (pick: (typeof pool)[number]) => {
+    const ak = artistKey(pick.song);
+    const al = String(pick.song.album?.id ?? pick.song.album?.title ?? "");
+    artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
+    if (al) albumCount.set(al, (albumCount.get(al) ?? 0) + 1);
+    lastArtist = ak;
+    chosen.push(pick);
+  };
+
+  while (chosen.length < mainTarget && mainPool.length > 0) {
+    let bestIdx = -1;
+    let bestVal = -Infinity;
+    for (let i = 0; i < mainPool.length; i++) {
+      const c = mainPool[i];
+      if (!c) continue;
+      const ak = artistKey(c.song);
+      const al = String(c.song.album?.id ?? c.song.album?.title ?? "");
+      if ((artistCount.get(ak) ?? 0) >= artistCap) continue;
+      if (al && (albumCount.get(al) ?? 0) >= 2) continue;
+      const v =
+        c.score -
+        0.6 * (artistCount.get(ak) ?? 0) -
+        0.4 * (albumCount.get(al) ?? 0) -
+        (ak && ak === lastArtist ? 1.0 : 0) +
+        Math.random() * 0.15;
+      if (v > bestVal) {
+        bestVal = v;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) break;
+    const pick = mainPool.splice(bestIdx, 1)[0];
+    if (!pick) break;
+    take(pick);
+  }
+
+  // 7) exploration: neeche ranked songs me se random 2 (artist cap ke andar)
+  const chosenIds = new Set(chosen.map((c) => c.id));
+  const explorePool = shuffleArr(
+    pool.slice(12).filter(
+      (c) =>
+        !chosenIds.has(c.id) &&
+        (artistCount.get(artistKey(c.song)) ?? 0) < artistCap,
+    ),
+  ).slice(0, exploreSlots);
+  explorePool.forEach((c, i) => {
+    chosen.splice(Math.min(4 + i * 4, chosen.length), 0, c);
+    const ak = artistKey(c.song);
+    artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
+  });
+
+  // 8) fill: bacha pool, lekin artist cap todke nahi (pehle cap, phir cap+1)
+  for (const cap of [artistCap, artistCap + 1]) {
+    for (const c of unique) {
+      if (chosen.length >= target) break;
+      if (chosen.some((x) => x.id === c.id)) continue;
+      const ak = artistKey(c.song);
+      if ((artistCount.get(ak) ?? 0) >= cap) continue;
+      chosen.push(c);
+      artistCount.set(ak, (artistCount.get(ak) ?? 0) + 1);
+    }
+  }
+
+  const stats = {
+    candidates: cand.size,
+    afterFilter: unique.length,
+    expanded,
+    usedTrending,
+    prefLangs,
+    relaxed,
+    uniqueArtists: new Set(chosen.map((c) => artistKey(c.song))).size,
+  };
+
+  return {
+    ids: chosen.map((c) => c.id),
+    debug: opts.debug
+      ? chosen.map((c) => ({
+          id: c.id,
+          title: decodeHtml(c.song.title),
+          artist: c.song.artists?.primary?.[0]?.name,
+          score: Number(c.score.toFixed(3)),
+          hits: c.hits,
+        }))
+      : [],
+    stats,
+  };
+}
+
 // Reco/radio khali aaye to artist/album search se similar songs banao
 async function getSimilar(songId: string, limit: number) {
   try {
@@ -572,6 +823,7 @@ export default {
         endpoints: [
           "/search?q=Tum%20Hi%20Ho  (ids + stream urls)",
           "/queue?seeds=ID1,ID2&exclude=PLAYED1&limit=10  (radio + stream urls)",
+          "/discover?seeds=ID1,ID2&langs=marathi,hindi&limit=16  (home feed)",
           "/api/search?q=Tum%20Hi%20Ho",
           "/api/recommendations?id=SONG_ID",
           "/api/radio/start?id=SONG_ID&limit=20",
@@ -799,18 +1051,28 @@ export default {
       }
     }
 
-    // ===== Vybe Queue Engine =====
+    // ===== Vybe Queue + Discover Engine =====
     // App-compatible: { success, data: [ApiSong...] } (saavn.dev format, downloadUrl ke saath)
     // /queue?seeds=cur,s2,s3&exclude=a,b,c&skipped=x,y&liked=p,q&limit=10[&debug=1]
-    if (url.pathname === "/queue") {
-      const seeds = csv(url.searchParams.get("seeds") || url.searchParams.get("id")).slice(0, 4);
+    // /discover?seeds=s1..s6&langs=marathi,hindi&exclude=..&limit=20  (Home: hero + Recommend For You)
+    if (url.pathname === "/queue" || url.pathname === "/discover") {
+      const isDiscover = url.pathname === "/discover";
+      const seeds = csv(url.searchParams.get("seeds") || url.searchParams.get("id")).slice(
+        0,
+        isDiscover ? 6 : 4,
+      );
+      let langs = csv(url.searchParams.get("langs")).map((l) => l.toLowerCase());
 
-      if (seeds.length === 0) {
+      if (seeds.length === 0 && !isDiscover) {
         return json(
           { success: false, data: null, message: "Missing seeds. Use ?seeds=id1,id2" },
           400,
         );
       }
+      if (isDiscover && seeds.length === 0 && langs.length === 0) {
+        langs = ["hindi"]; // cold start
+      }
+      if (!isDiscover) langs = []; // queue me seed ki language hi chalegi
 
       const exclude = new Set<string>([
         ...seeds,
@@ -820,23 +1082,34 @@ export default {
       const liked = csv(url.searchParams.get("liked"));
       const limit = Math.min(
         30,
-        Math.max(1, Number(url.searchParams.get("limit")) || 10),
+        Math.max(1, Number(url.searchParams.get("limit")) || (isDiscover ? 16 : 10)),
       );
       const debug = url.searchParams.get("debug") === "1";
 
       try {
-        const { ids, debug: dbg, stats } = await buildQueueIds({
-          seeds,
-          exclude,
-          skipped,
-          liked,
-          target: limit + 5, // 5 spare, kyunki kuch songs ka URL missing ho sakta hai
-          debug,
-        });
+        const built = isDiscover
+          ? await buildDiscoverIds({
+              seeds,
+              exclude,
+              skipped,
+              liked,
+              langs,
+              target: limit + 5,
+              debug,
+            })
+          : await buildQueueIds({
+              seeds,
+              exclude,
+              skipped,
+              liked,
+              target: limit + 5, // 5 spare, kyunki kuch songs ka URL missing ho sakta hai
+              debug,
+            });
+        const { ids, debug: dbg, stats } = built;
 
         if (ids.length === 0) {
           return json(
-            { success: false, data: [], message: "No songs found for these seeds" },
+            { success: false, data: [], message: "No songs found" },
             404,
           );
         }
@@ -849,7 +1122,7 @@ export default {
 
         return json({
           success: true,
-          engine: "vybe-queue-v1",
+          engine: isDiscover ? "vybe-discover-v1" : "vybe-queue-v1",
           count: data.length,
           data,
           ...(debug ? { stats, debug: dbg } : {}),
